@@ -137,8 +137,17 @@ else:
     last_name       = st.text_input("Player Last Name", "skubal")
     first_name      = st.text_input("Player First Name", "tarik")
     opponent_team   = st.text_input("Opponent Team Abbreviation", "SEA")
-    sportsbook_line = st.number_input("Sportsbook Line", value=6.5)
-    american_odds   = st.number_input("American Odds", value=-110)
+    sportsbook_line = st.number_input("Sportsbook Line (e.g. 6.5)", value=6.5, step=0.5)
+
+    st.caption("Enter the odds for each side separately — books often shade these differently.")
+    odds_col1, odds_col2 = st.columns(2)
+    with odds_col1:
+        over_odds  = st.number_input("Over Odds (e.g. -115)", value=-115)
+    with odds_col2:
+        under_odds = st.number_input("Under Odds (e.g. -105)", value=-105)
+
+    # Keep american_odds as over_odds for any legacy references
+    american_odds = over_odds
 
 # ---------------------------------------------------------------------------
 # Core math helpers
@@ -170,11 +179,17 @@ def expected_value(model_prob, odds):
 def normalize(value, center, scale):
     return (value - center) / scale
 
-def confidence_label(edge, ev):
-    if   ev > 0.10 and edge >  0.7: return "Strong Play"
-    elif ev > 0.03 and edge >  0.3: return "Lean Over"
-    elif ev < -0.10 and edge < -0.7: return "Strong Under"
-    elif ev < -0.03 and edge < -0.3: return "Lean Under"
+def confidence_label(edge, over_ev, under_ev):
+    """
+    Evaluate both sides of a prop independently.
+    edge > 0 means projection is above the line (lean over).
+    edge < 0 means projection is below the line (lean under).
+    We evaluate whichever side has positive EV.
+    """
+    if   over_ev  > 0.10 and edge >  0.5: return "Strong Over"
+    elif over_ev  > 0.03 and edge >  0.2: return "Lean Over"
+    elif under_ev > 0.10 and edge < -0.5: return "Strong Under"
+    elif under_ev > 0.03 and edge < -0.2: return "Lean Under"
     return "No Bet"
 
 def moneyline_label(ev, model_prob, implied_prob, american_odds):
@@ -204,19 +219,33 @@ def moneyline_label(ev, model_prob, implied_prob, american_odds):
         - Heavy chalk (-160 or worse): vig kills value, need 7%+ edge
         - Negative edge: model agrees with or is below book — no value
     """
-    edge_pct = model_prob - implied_prob
+    # Round to avoid floating point edge cases (e.g. 0.51999... vs 0.52)
+    mp       = round(model_prob,   4)
+    ip       = round(implied_prob, 4)
+    edge_pct = round(mp - ip,      4)
+    ev_r     = round(ev,           4)
 
-    # Hard block 1: model not confident enough — true coin flip territory
-    if model_prob < 0.52:
+    # Hard block 1: model not confident enough
+    if mp < 0.52:
         return "No Bet"
 
-    # Hard block 2: negative or zero edge — book has it right or better
+    # Hard block 2: negative or zero edge
     if edge_pct <= 0:
         return "No Bet"
 
-    # Hard block 3: heavy chalk — vig destroys value, need large edge
+    # Hard block 3: heavy chalk
     if american_odds <= -160 and edge_pct < 0.07:
         return "No Bet"
+
+    # Tier 1: Strong Bet
+    if mp >= 0.54 and edge_pct >= 0.05 and ev_r >= 0.04:
+        return "Strong Bet"
+
+    # Tier 2: Lean
+    if mp >= 0.52 and edge_pct >= 0.03 and ev_r >= 0.02:
+        return "Lean"
+
+    return "No Bet"
 
     # Tier 1: Strong Bet — solid win confidence + clear value
     if model_prob >= 0.54 and edge_pct >= 0.05 and ev >= 0.04:
@@ -326,8 +355,20 @@ def get_pitcher_info(player_id):
             except ValueError:
                 pass
 
-    # Overlay FIP data
+    # Overlay FIP data from Fangraphs
     fip_data = get_pitcher_fip(int(player_id), today.year)
+
+    # If FIP lookup returned all defaults (4.20), estimate from ERA instead.
+    # FIP closely tracks ERA; xFIP regresses toward mean more aggressively.
+    # This ensures the model uses real pitching signal even when Fangraphs
+    # ID matching fails, rather than cancelling out both pitchers at 4.20.
+    if fip_data["fip"] == 4.20 and fip_data["xfip"] == 4.20 and era != 4.30:
+        fip_data["fip"]   = round(era * 0.95 + 4.20 * 0.05, 3)
+        fip_data["xfip"]  = round(era * 0.88 + 4.20 * 0.12, 3)
+        fip_data["siera"] = round(era * 0.85 + 4.20 * 0.15, 3)
+        # Estimate K/9 from ERA (rough inverse relationship)
+        fip_data["k_per_9"] = round(max(4.0, 12.0 - era * 1.0), 1)
+
     fip_data["era"]    = era
     fip_data["throws"] = throws
     fip_data["name"]   = name
@@ -923,9 +964,15 @@ def team_moneyline_probability(
     team_ops = calculate_team_ops_vs_hand(team,          opp_p_info["throws"])
     opp_ops  = calculate_team_ops_vs_hand(opponent_team, sel_p_info["throws"])
 
-    # B. wRC+
+    # B. wRC+ — if Fangraphs lookup returns 100 (default) for both teams,
+    # estimate from runs/game: wRC+ ≈ 100 + (R/G - 4.5) * 16
     team_wrc = get_team_wrc_plus(team,          today.year)
     opp_wrc  = get_team_wrc_plus(opponent_team, today.year)
+
+    if team_wrc == 100.0 and opp_wrc == 100.0:
+        team_wrc = round(100 + (team_season["runs_scored"] - 4.5) * 16, 1)
+        opp_wrc  = round(100 + (opp_season["runs_scored"]  - 4.5) * 16, 1)
+
     wrc_edge = normalize(team_wrc - opp_wrc, 0, 15)  # 15 pt diff = 1σ
 
     # Bullpen
@@ -1045,10 +1092,29 @@ def team_moneyline_probability(
     # Strong favorite (score ~3.5) -> ~60-61% | Close game (score ~0.8) -> ~52%
     # Extreme mismatch (score ~6+) -> ~68% max — realistic MLB ceiling
     TEMPERATURE = 8.0
-    model_prob = 1 / (1 + math.exp(-matchup_score / TEMPERATURE))
+    model_prob = round(1 / (1 + math.exp(-matchup_score / TEMPERATURE)), 6)
 
     return {
         "model_prob":        model_prob,
+        "matchup_score":     matchup_score,
+        "score_breakdown": {
+            "season_win_edge":  round(season_win_edge * 1.0, 3),
+            "recent_win_edge":  round(recent_win_edge * 0.8, 3),
+            "starter_edge":     round(normalize(starter_edge, 0, 2) * 1.2, 3),
+            "bullpen_edge":     round(normalize(bullpen_edge, 0, 1) * 0.8, 3),
+            "wrc_edge":         round(wrc_edge * 0.7, 3),
+            "handedness_edge":  round(normalize(handedness_edge, 0, 0.15) * 0.4, 3),
+            "offense_edge":     round(normalize(offense_edge, 0, 2) * 0.3, 3),
+            "defense_edge":     round(normalize(defense_edge, 0, 2) * 0.4, 3),
+            "late_inning":      round(normalize(late_inning_edge, 0, 1) * 0.5, 3),
+            "h2h":              round(h2h_edge * 0.4, 3),
+            "rest":             round(rest_edge * 0.2, 3),
+            "streak":           round(streak_edge * 0.15, 3),
+            "park":             round(normalize(park_offense_boost, 0, 0.5) * 0.3, 3),
+            "weather":          round(wx_edge * 0.15, 3),
+            "injury":           round(injury_edge * 0.3, 3),
+            "home_field":       round(home_field_edge * 0.15, 3),
+        },
         "team_season":       team_season,
         "opp_season":        opp_season,
         "team_recent":       team_recent,
@@ -1169,6 +1235,19 @@ if st.button("Predict"):
             st.write(f"{check(edge_ok_lean)} Edge over book ≥3%  →  {edge_pct*100:+.1f}%")
             st.write(f"{check(ev_ok_lean)} Expected value ≥2%  →  {ev*100:.1f}%")
             st.write(f"{check(edge_pct > 0)} Positive edge (model > book)  →  {edge_pct*100:+.1f}%")
+
+        # ---- Score debug panel ----
+        with st.expander("🔬 Model Score Breakdown (why this probability?)"):
+            st.caption(f"Raw matchup score: **{result['matchup_score']:.3f}** → sigmoid → **{result['model_prob']*100:.1f}%**")
+            bd = result["score_breakdown"]
+            rows = sorted(bd.items(), key=lambda x: abs(x[1]), reverse=True)
+            for factor, contribution in rows:
+                bar = "█" * int(abs(contribution) * 20)
+                direction = "▲" if contribution > 0 else ("▼" if contribution < 0 else "—")
+                st.text(f"  {direction} {factor:<20} {contribution:+.3f}  {bar}")
+            st.caption("Positive = favors your team. Largest contributors shown first.")
+            if team_wrc := result.get("team_wrc"):
+                st.caption(f"wRC+ used: {result.get('team_wrc', 100):.0f} vs {result.get('opp_wrc', 100):.0f}")
 
         # ---- Starting Pitchers ----
         st.subheader("⚾ Starting Pitchers")
@@ -1316,152 +1395,463 @@ if st.button("Predict"):
         player_id = get_player_id(last_name, first_name)
 
         if player_id is None:
-            st.error("Player not found. Check spelling.")
-        else:
-            with st.spinner("Fetching Statcast data…"):
-                if prop_type == "Pitcher Strikeouts":
-                    season_data = statcast_pitcher(season_start, season_end, player_id)
-                    recent_data = statcast_pitcher(recent_start, recent_end, player_id)
+            st.error("❌ Player not found. Check spelling of first and last name.")
+            st.stop()
 
-                    season_by_game = season_data[season_data["events"] == "strikeout"].groupby("game_date").size()
-                    recent_by_game = recent_data[recent_data["events"] == "strikeout"].groupby("game_date").size()
-                    stat_name = "Strikeouts"
+        # ----------------------------------------------------------------
+        # Minimum data requirements before we attempt a prediction
+        # ----------------------------------------------------------------
+        MIN_GAMES_SEASON = 5   # need at least 5 starts/games for a season avg
+        MIN_GAMES_RECENT = 3   # need at least 3 recent games to weight recent form
 
-                elif prop_type == "Batter Hits":
-                    season_data = statcast_batter(season_start, season_end, player_id)
-                    recent_data = statcast_batter(recent_start, recent_end, player_id)
+        with st.spinner("Fetching Statcast data…"):
+            if prop_type == "Pitcher Strikeouts":
+                season_data = statcast_pitcher(season_start, season_end, player_id)
+                recent_data = statcast_pitcher(recent_start, recent_end, player_id)
 
-                    hit_events = ["single","double","triple","home_run"]
-                    season_by_game = season_data[season_data["events"].isin(hit_events)].groupby("game_date").size()
-                    recent_by_game = recent_data[recent_data["events"].isin(hit_events)].groupby("game_date").size()
-                    stat_name = "Hits"
+                if season_data.empty:
+                    st.error("❌ No Statcast data found for this pitcher this season. They may be injured, a reliever, or not yet in the Statcast database.")
+                    st.stop()
 
-                else:
-                    season_data = statcast_batter(season_start, season_end, player_id)
-                    recent_data = statcast_batter(recent_start, recent_end, player_id)
+                season_by_game = season_data[season_data["events"] == "strikeout"].groupby("game_date").size()
+                recent_by_game = recent_data[recent_data["events"] == "strikeout"].groupby("game_date").size()
 
-                    season_data["tb"] = season_data["events"].apply(total_bases_from_event)
-                    recent_data["tb"] = recent_data["events"].apply(total_bases_from_event)
-                    season_by_game = season_data.groupby("game_date")["tb"].sum()
-                    recent_by_game = recent_data.groupby("game_date")["tb"].sum()
-                    stat_name = "Total Bases"
+                # Count actual starts (games where pitcher threw pitches)
+                season_starts = season_data["game_date"].nunique()
+                recent_starts = recent_data["game_date"].nunique() if not recent_data.empty else 0
 
-            if season_by_game.empty:
-                st.error("No data found for this player/prop.")
+                stat_name = "Strikeouts"
+
+            elif prop_type == "Batter Hits":
+                season_data = statcast_batter(season_start, season_end, player_id)
+                recent_data = statcast_batter(recent_start, recent_end, player_id)
+
+                if season_data.empty:
+                    st.error("❌ No Statcast data found for this batter this season. They may be injured or not yet active.")
+                    st.stop()
+
+                hit_events = ["single", "double", "triple", "home_run"]
+                season_by_game = season_data[season_data["events"].isin(hit_events)].groupby("game_date").size()
+                recent_by_game = recent_data[recent_data["events"].isin(hit_events)].groupby("game_date").size()
+
+                season_starts = season_data["game_date"].nunique()
+                recent_starts = recent_data["game_date"].nunique() if not recent_data.empty else 0
+
+                stat_name = "Hits"
+
+            else:  # Total Bases
+                season_data = statcast_batter(season_start, season_end, player_id)
+                recent_data = statcast_batter(recent_start, recent_end, player_id)
+
+                if season_data.empty:
+                    st.error("❌ No Statcast data found for this batter this season.")
+                    st.stop()
+
+                season_data = season_data.copy()
+                recent_data = recent_data.copy()
+                season_data["tb"] = season_data["events"].apply(total_bases_from_event)
+                recent_data["tb"] = recent_data["events"].apply(total_bases_from_event)
+                season_by_game = season_data.groupby("game_date")["tb"].sum()
+                recent_by_game = recent_data.groupby("game_date")["tb"].sum()
+
+                season_starts = season_data["game_date"].nunique()
+                recent_starts = recent_data["game_date"].nunique() if not recent_data.empty else 0
+
+                stat_name = "Total Bases"
+
+        # ----------------------------------------------------------------
+        # Data quality gate — stop early with a clear explanation
+        # ----------------------------------------------------------------
+        data_warnings = []
+        data_errors   = []
+
+        if season_by_game.empty:
+            data_errors.append(
+                f"No {stat_name.lower()} recorded in Statcast data this season. "
+                f"This usually means the player has not appeared in games yet, "
+                f"is on the IL, or was just called up."
+            )
+
+        elif season_starts < MIN_GAMES_SEASON:
+            data_errors.append(
+                f"Only **{season_starts} games** found this season — need at least "
+                f"{MIN_GAMES_SEASON} for a reliable season average. "
+                f"Prediction would be based on too small a sample to trust."
+            )
+
+        if data_errors:
+            st.error("❌ Insufficient data to predict")
+            for err in data_errors:
+                st.write(f"• {err}")
+            st.info(
+                "💡 What you can do:\n"
+                "- Check that the player is active and starting today\n"
+                "- Try again once more games are in the Statcast database\n"
+                "- For early-season predictions, use caution — small samples are unreliable"
+            )
+            st.stop()
+
+        # Warn but don't stop for borderline cases
+        if season_starts < 10:
+            data_warnings.append(
+                f"⚠️ Small season sample ({season_starts} games) — projection is less reliable than mid/late season."
+            )
+
+        if recent_starts < MIN_GAMES_RECENT:
+            data_warnings.append(
+                f"⚠️ Only {recent_starts} games in the last 30 days — using season average only for recent form."
+            )
+
+        # ----------------------------------------------------------------
+        # Core projection
+        # ----------------------------------------------------------------
+        season_avg = season_by_game.mean()
+
+        # For recent avg: fill games where stat = 0 (player played but got 0 Ks/hits)
+        # This is important — a game with 0 strikeouts is real data, not missing data
+        if not recent_data.empty and recent_starts > 0:
+            recent_game_dates = recent_data["game_date"].unique()
+            if prop_type == "Pitcher Strikeouts":
+                recent_by_game_filled = recent_by_game.reindex(recent_game_dates, fill_value=0)
+            elif prop_type == "Batter Hits":
+                # For batters, only count games where they had a plate appearance
+                pa_games = recent_data[recent_data["events"].notna()]["game_date"].unique()
+                recent_by_game_filled = recent_by_game.reindex(pa_games, fill_value=0)
             else:
-                season_avg = season_by_game.mean()
-                recent_avg = recent_by_game.mean() if not recent_by_game.empty else float("nan")
-                projection = calc_weighted_projection(season_avg, recent_avg)
+                pa_games = recent_data[recent_data["events"].notna()]["game_date"].unique()
+                recent_by_game_filled = recent_by_game.reindex(pa_games, fill_value=0)
 
-                adj          = 1.0
-                k_park_adj   = 1.0
-                umpire_adj   = 1.0
-                wx_k_adj     = 1.0
-                swstr_pct    = None
-                umpire_name_prop = None
-                weather_info = None
+            recent_avg = recent_by_game_filled.mean() if len(recent_by_game_filled) >= MIN_GAMES_RECENT else float("nan")
+        else:
+            recent_avg = float("nan")
 
-                if prop_type == "Pitcher Strikeouts":
-                    # Find today's game to get umpire + weather
-                    schedule_data = get_mlb_schedule(today_str)
-                    for db in schedule_data.get("dates", []):
-                        for game in db.get("games", []):
-                            for off in game.get("officials", []):
-                                if off.get("officialType") == "Home Plate":
-                                    umpire_name_prop = off["official"].get("fullName")
+        projection = calc_weighted_projection(season_avg, recent_avg)
 
-                    adj        = opponent_k_adjustment(opponent_team)
-                    k_park_adj = PARK_K_FACTORS.get(opponent_team.upper(), 1.0)
-                    umpire_adj = get_umpire_k_adjustment(umpire_name_prop)
+        # ----------------------------------------------------------------
+        # Prop-specific adjustments
+        # ----------------------------------------------------------------
+        adj              = 1.0
+        k_park_adj       = 1.0
+        umpire_adj       = 1.0
+        wx_k_adj         = 1.0
+        hit_pitcher_adj  = 1.0
+        hit_handedness   = 1.0
+        swstr_pct        = None
+        umpire_name_prop = None
+        weather_info     = None
+        fip_data         = None
+        pitcher_hand     = None
+        opp_pitcher_era  = None
 
-                    # C. SwStr% quality signal
-                    swstr_pct = get_pitcher_swstr(player_id)
-                    if swstr_pct is not None:
-                        # League avg SwStr% ~11%; every 1% above/below = ~3% K rate change
-                        swstr_factor = 1.0 + (swstr_pct - 0.11) * 3.0
-                        adj *= max(min(swstr_factor, 1.30), 0.70)
+        if prop_type == "Pitcher Strikeouts":
+            # --- Opponent K-rate adjustment ---
+            adj = opponent_k_adjustment(opponent_team)
 
-                    # G. Weather K adjustment
-                    p_info      = get_pitcher_info(player_id)
-                    home_team   = opponent_team  # pitcher's opponent = home or away?
-                    coords      = PARK_COORDS.get(opponent_team.upper(),
-                                                  PARK_COORDS.get("NYY"))
-                    weather_info = get_weather(coords[0], coords[1], today_str)
-                    wx_k_adj    = weather_k_factor(
-                        weather_info["temp_f"], weather_info["wind_mph"]
-                    )
+            # --- Park strikeout factor ---
+            k_park_adj = PARK_K_FACTORS.get(opponent_team.upper(), 1.0)
 
-                    projection = projection * adj * k_park_adj * umpire_adj * wx_k_adj
+            # --- Umpire adjustment ---
+            schedule_data = get_mlb_schedule(today_str)
+            for db in schedule_data.get("dates", []):
+                for game in db.get("games", []):
+                    for off in game.get("officials", []):
+                        if off.get("officialType") == "Home Plate":
+                            umpire_name_prop = off["official"].get("fullName")
+            umpire_adj = get_umpire_k_adjustment(umpire_name_prop)
 
-                # Std-dev aware probability (Improvement from previous version)
-                std_dev = float(season_by_game.std()) if len(season_by_game) > 1 else 1.5
+            # --- SwStr% quality signal ---
+            swstr_pct = get_pitcher_swstr(player_id)
+            if swstr_pct is not None:
+                swstr_factor = 1.0 + (swstr_pct - 0.11) * 3.0
+                adj *= max(min(swstr_factor, 1.30), 0.70)
+            else:
+                data_warnings.append("⚠️ SwStr% unavailable (fewer than 50 pitches in last 30 days) — pitch quality signal skipped.")
 
-                edge         = projection - sportsbook_line
-                over_prob    = estimate_over_probability(projection, sportsbook_line, std_dev)
-                implied_prob = implied_probability(american_odds)
-                ev           = expected_value(over_prob, american_odds)
-                label        = confidence_label(edge, ev)
+            # --- FIP/xFIP pitcher quality metrics ---
+            fip_data = get_pitcher_info(player_id)
 
-                st.subheader("📊 Prediction Results")
+            # --- Weather ---
+            coords       = PARK_COORDS.get(opponent_team.upper(), PARK_COORDS.get("NYY"))
+            weather_info = get_weather(coords[0], coords[1], today_str)
+            wx_k_adj     = weather_k_factor(weather_info["temp_f"], weather_info["wind_mph"])
 
-                rcol1, rcol2, rcol3 = st.columns(3)
-                rcol1.metric("Season Avg",   f"{season_avg:.2f}")
-                rcol2.metric("Recent Avg",   f"{recent_avg:.2f}")
-                rcol3.metric("Projection",   f"{projection:.2f}")
+            projection = projection * adj * k_park_adj * umpire_adj * wx_k_adj
 
-                if prop_type == "Pitcher Strikeouts":
-                    st.write(f"**Adjustments applied:**")
-                    st.write(f"• Opponent K-Rate: {adj:.3f}x")
-                    st.write(f"• Park K-Factor ({opponent_team.upper()}): {k_park_adj:.2f}x")
-                    st.write(f"• Umpire ({umpire_name_prop or 'Unknown'}): {umpire_adj:.2f}x")
-                    if swstr_pct is not None:
-                        st.write(
-                            f"• SwStr% Quality Signal: {swstr_pct*100:.1f}% "
-                            f"(league avg ~11%)"
-                        )
-                    st.write(f"• Weather K-Factor: {wx_k_adj:.3f}x")
-                    if weather_info:
-                        st.caption(
-                            f"Weather at park: {weather_info['temp_f']:.0f}°F, "
-                            f"{weather_info['wind_mph']:.0f} mph wind"
-                        )
+        elif prop_type in ("Batter Hits", "Batter Total Bases"):
+            # --- Opposing pitcher handedness & quality adjustment ---
+            matchup_info = find_today_matchup(opponent_team, opponent_team)
+            # Try to find the specific game this batter is in
+            schedule_data = get_mlb_schedule(today_str)
+            opp_pitcher_id = None
 
-                    # A. FIP/xFIP for pitcher prop display
-                    fip_data = get_pitcher_info(player_id)
-                    babip_flag = babip_regression_flag(fip_data.get("babip", 0.300))
+            for db in schedule_data.get("dates", []):
+                for game in db.get("games", []):
+                    home_id = game["teams"]["home"]["team"]["id"]
+                    away_id = game["teams"]["away"]["team"]["id"]
+                    opp_id  = TEAM_ID_MAP.get(opponent_team.upper())
 
-                    st.subheader("⚾ Pitcher Quality Metrics")
-                    pcols = st.columns(5)
-                    pcols[0].metric("ERA",   f"{fip_data['era']:.2f}")
-                    pcols[1].metric("FIP",   f"{fip_data['fip']:.2f}")
-                    pcols[2].metric("xFIP",  f"{fip_data['xfip']:.2f}")
-                    pcols[3].metric("SIERA", f"{fip_data['siera']:.2f}")
-                    pcols[4].metric("K/9",   f"{fip_data['k_per_9']:.1f}")
-                    if babip_flag:
-                        st.caption(babip_flag)
+                    if opp_id in (home_id, away_id):
+                        # Opponent is pitching against our batter's team
+                        if home_id == opp_id:
+                            p = game["teams"]["home"].get("probablePitcher")
+                        else:
+                            p = game["teams"]["away"].get("probablePitcher")
+                        if p:
+                            opp_pitcher_id = p["id"]
+                        break
 
-                st.write(f"Sportsbook Line: {sportsbook_line} | Edge: {edge:.2f} | Std Dev: ±{std_dev:.2f}")
+            if opp_pitcher_id:
+                opp_info     = get_pitcher_info(opp_pitcher_id)
+                pitcher_hand = opp_info["throws"]
+                opp_fip      = opp_info.get("fip", 4.20)
+                opp_xfip     = opp_info.get("xfip", 4.20)
+                opp_pitcher_era = opp_info["era"]
 
-                st.subheader("💰 Betting Value")
-                vcol1, vcol2, vcol3 = st.columns(3)
-                vcol1.metric("Over Probability", f"{over_prob*100:.1f}%")
-                vcol2.metric("Implied Prob",     f"{implied_prob*100:.1f}%")
-                vcol3.metric("Expected Value",   f"{ev*100:.1f}%")
+                # FIP-based pitcher difficulty: league avg FIP ~4.20
+                # A 3.20 FIP pitcher suppresses hits ~8% vs average
+                fip_difficulty = (opp_fip - 4.20) / 4.20  # positive = easier, negative = harder
+                hit_pitcher_adj = max(0.80, min(1.20, 1.0 + fip_difficulty * 0.5))
 
-                st.write(f"**Confidence: {label}**")
+                # Handedness: pull from Statcast platoon splits
+                batter_ops_vs_hand = calculate_team_ops_vs_hand(
+                    # Use opponent team's batting stats as proxy — not ideal
+                    # but Statcast doesn't give individual platoon in this flow
+                    opponent_team,
+                    pitcher_hand
+                )
+                # Platoon adjustment: OPS vs hand relative to league avg (.700)
+                platoon_factor = batter_ops_vs_hand / 0.700
+                hit_handedness = max(0.85, min(1.15, platoon_factor))
 
-                if label == "Strong Play":
-                    st.success("✅ Strong OVER value")
-                elif label == "Lean Over":
-                    st.success("📊 Lean OVER")
-                elif label == "Strong Under":
-                    st.warning("⬇️ Strong UNDER value")
-                elif label == "Lean Under":
-                    st.warning("📉 Lean UNDER")
+                projection = projection * hit_pitcher_adj * hit_handedness
+            else:
+                data_warnings.append("⚠️ Could not find today's opposing pitcher — pitcher quality and handedness adjustments skipped.")
+
+            # --- Park run factor for hit/TB props ---
+            park_key = opponent_team.upper()
+            park_run_factor = PARK_FACTORS.get(park_key, 1.00)
+            projection = projection * park_run_factor
+
+            # --- Weather for hits/TB ---
+            coords       = PARK_COORDS.get(park_key, PARK_COORDS.get("NYY"))
+            weather_info = get_weather(coords[0], coords[1], today_str)
+            wx_hit_adj   = weather_run_factor(weather_info["temp_f"], weather_info["wind_mph"], weather_info["wind_dir_deg"])
+            # Cap weather effect on individual player props
+            wx_hit_adj   = max(0.97, min(1.03, wx_hit_adj))
+            projection   = projection * wx_hit_adj
+
+        # ----------------------------------------------------------------
+        # Probability & EV calculation — evaluated for BOTH sides
+        # ----------------------------------------------------------------
+        std_dev  = float(season_by_game.std()) if len(season_by_game) > 1 else 1.5
+        std_dev  = max(std_dev, 0.8)  # floor: don't over-tighten for very consistent players
+
+        edge      = projection - sportsbook_line
+        over_prob = estimate_over_probability(projection, sportsbook_line, std_dev)
+        under_prob = 1.0 - over_prob
+
+        # Each side gets its own implied probability and EV
+        over_implied  = implied_probability(over_odds)
+        under_implied = implied_probability(under_odds)
+
+        over_ev   = expected_value(over_prob,  over_odds)
+        under_ev  = expected_value(under_prob, under_odds)
+
+        # Vig check: total implied prob > 100% = book is taking juice (normal)
+        total_implied = over_implied + under_implied
+        vig_pct = (total_implied - 1.0) * 100  # e.g. 4.8% vig on a standard -110/-110 line
+
+        label = confidence_label(edge, over_ev, under_ev)
+
+        # Legacy single-side ev for any remaining references
+        implied_prob = over_implied
+        ev = over_ev
+
+        # ----------------------------------------------------------------
+        # Display warnings first so user sees them before results
+        # ----------------------------------------------------------------
+        if data_warnings:
+            for w in data_warnings:
+                st.warning(w)
+
+        # ----------------------------------------------------------------
+        # Results display
+        # ----------------------------------------------------------------
+        st.subheader(f"📊 {stat_name} Prediction")
+
+        rcol1, rcol2, rcol3, rcol4 = st.columns(4)
+        rcol1.metric("Season Avg",    f"{season_avg:.2f}",
+                     help=f"Based on {season_starts} games this season")
+        rcol2.metric("Recent Avg",    f"{recent_avg:.2f}" if not math.isnan(recent_avg) else "N/A",
+                     help=f"Based on {recent_starts} games in last 30 days (zeros included)")
+        rcol3.metric("Projection",    f"{projection:.2f}")
+        rcol4.metric("Sportsbook Line", f"{sportsbook_line:.1f}")
+
+        # ---- Sample size indicator ----
+        if season_starts >= 20:
+            sample_quality = "🟢 Good sample"
+        elif season_starts >= 10:
+            sample_quality = "🟡 Moderate sample"
+        else:
+            sample_quality = "🔴 Small sample — treat with caution"
+
+        st.caption(
+            f"{sample_quality} | Season: {season_starts} games | "
+            f"Recent (30d): {recent_starts} games | "
+            f"Std Dev: ±{std_dev:.2f} (player consistency)"
+        )
+
+        # ---- Prop-specific adjustment details ----
+        if prop_type == "Pitcher Strikeouts" and fip_data:
+            st.subheader("⚾ Pitcher Quality Metrics")
+            pcols = st.columns(5)
+            pcols[0].metric("ERA",   f"{fip_data['era']:.2f}")
+            pcols[1].metric("FIP",   f"{fip_data['fip']:.2f}")
+            pcols[2].metric("xFIP",  f"{fip_data['xfip']:.2f}")
+            pcols[3].metric("SIERA", f"{fip_data['siera']:.2f}")
+            pcols[4].metric("K/9",   f"{fip_data['k_per_9']:.1f}")
+            babip_flag = babip_regression_flag(fip_data.get("babip", 0.300))
+            if babip_flag:
+                st.caption(babip_flag)
+
+            st.subheader("🔧 Strikeout Adjustments")
+            acol1, acol2, acol3, acol4 = st.columns(4)
+            acol1.metric("Opp K-Rate",    f"{adj:.3f}x",
+                         help="How often opponent strikes out vs league average")
+            acol2.metric("Park Factor",   f"{k_park_adj:.3f}x",
+                         help="Strikeout park factor at opponent's home park")
+            acol3.metric("Umpire",        f"{umpire_adj:.3f}x",
+                         help=f"Umpire: {umpire_name_prop or 'Unknown'}")
+            acol4.metric("Weather",       f"{wx_k_adj:.3f}x",
+                         help="Temperature/wind effect on strikeout rate")
+
+            if swstr_pct is not None:
+                st.metric("SwStr% Signal", f"{swstr_pct*100:.1f}%",
+                          help="Swinging strike %. League avg ~11%. Higher = better stuff today.")
+            if weather_info:
+                st.caption(f"🌤️ Park weather: {weather_info['temp_f']:.0f}°F, {weather_info['wind_mph']:.0f} mph wind")
+
+        elif prop_type in ("Batter Hits", "Batter Total Bases"):
+            st.subheader("🔧 Hit/TB Adjustments")
+
+            if opp_pitcher_era is not None:
+                acol1, acol2, acol3, acol4 = st.columns(4)
+                acol1.metric("Pitcher Difficulty", f"{hit_pitcher_adj:.3f}x",
+                             help=f"Opp pitcher ERA {opp_pitcher_era:.2f}, FIP-adjusted")
+                acol2.metric("Platoon Factor",     f"{hit_handedness:.3f}x",
+                             help=f"Batter vs {pitcher_hand}HP based on team platoon splits")
+                pf_val = PARK_FACTORS.get(opponent_team.upper(), 1.00)
+                acol3.metric("Park Factor",        f"{pf_val:.3f}x",
+                             help="Run-scoring environment at this park")
+                acol4.metric("Weather",            f"{wx_hit_adj:.3f}x" if weather_info else "N/A",
+                             help="Temperature/wind run factor (capped ±3%)")
+                if pitcher_hand:
+                    st.caption(f"Opposing pitcher throws: **{pitcher_hand}**")
+            if weather_info:
+                st.caption(f"🌤️ Park weather: {weather_info['temp_f']:.0f}°F, {weather_info['wind_mph']:.0f} mph wind")
+
+        # ---- Betting value ----
+        st.subheader("💰 Betting Value")
+
+        # Summary line
+        st.write(
+            f"Projection: **{projection:.2f}** vs Line: **{sportsbook_line:.1f}** | "
+            f"Edge: **{edge:+.2f}** | Model Prob Over: **{over_prob*100:.1f}%** | "
+            f"Std Dev: ±{std_dev:.2f}"
+        )
+
+        # Vig display
+        st.caption(f"Book vig: {vig_pct:.1f}% (total implied = {total_implied*100:.1f}%)")
+
+        # Side-by-side over/under breakdown
+        over_col, under_col = st.columns(2)
+
+        with over_col:
+            st.markdown("### 📈 OVER")
+            o1, o2, o3 = st.columns(3)
+            o1.metric("Your Odds",      f"{over_odds:+d}")
+            o2.metric("Book Implied",   f"{over_implied*100:.1f}%")
+            o3.metric("Model Prob",     f"{over_prob*100:.1f}%")
+            edge_over = over_prob - over_implied
+            ev_over_pct = over_ev * 100
+            st.metric("Edge vs Book",   f"{edge_over*100:+.1f}%",
+                      delta_color="normal" if edge_over > 0 else "inverse")
+            st.metric("Expected Value", f"{ev_over_pct:.1f}%",
+                      delta_color="normal" if over_ev > 0 else "inverse")
+            if label in ("Strong Over", "Lean Over"):
+                if label == "Strong Over":
+                    st.success("✅ Strong OVER")
                 else:
-                    st.info("⛔ No Bet")
+                    st.success("📊 Lean OVER")
+            else:
+                st.info("No value on OVER")
 
-                st.subheader("📅 Season Game Log")
-                game_log = season_by_game.reset_index(name=stat_name)
-                st.dataframe(game_log)
-                st.bar_chart(game_log.set_index("game_date"))
+        with under_col:
+            st.markdown("### 📉 UNDER")
+            u1, u2, u3 = st.columns(3)
+            u1.metric("Your Odds",      f"{under_odds:+d}")
+            u2.metric("Book Implied",   f"{under_implied*100:.1f}%")
+            u3.metric("Model Prob",     f"{under_prob*100:.1f}%")
+            edge_under = under_prob - under_implied
+            ev_under_pct = under_ev * 100
+            st.metric("Edge vs Book",   f"{edge_under*100:+.1f}%",
+                      delta_color="normal" if edge_under > 0 else "inverse")
+            st.metric("Expected Value", f"{ev_under_pct:.1f}%",
+                      delta_color="normal" if under_ev > 0 else "inverse")
+            if label in ("Strong Under", "Lean Under"):
+                if label == "Strong Under":
+                    st.warning("⬇️ Strong UNDER")
+                else:
+                    st.warning("📉 Lean UNDER")
+            else:
+                st.info("No value on UNDER")
+
+        # Overall verdict
+        st.divider()
+        if label == "No Bet":
+            st.info(
+                "⛔ No Bet — projection does not show sufficient edge on either side. "
+                f"Model sees {over_prob*100:.1f}% chance of going OVER, but neither "
+                f"side's odds offer enough value to overcome the vig."
+            )
+
+        # Vig warning: if both sides have negative EV, explain why
+        if over_ev < 0 and under_ev < 0:
+            st.caption(
+                f"Both sides show negative EV — the {vig_pct:.1f}% book vig is too high "
+                f"relative to the model's edge. This is common on heavily juiced lines."
+            )
+
+        # ---- Reliability note ----
+        if season_starts < 10:
+            st.warning(
+                f"⚠️ **Low confidence prediction** — only {season_starts} games in sample. "
+                f"Projections stabilize after ~15-20 games. Consider waiting for more data "
+                f"before betting."
+            )
+
+        # ---- Season game log ----
+        st.subheader("📅 Season Game Log")
+
+        # Show full game log including zeros for games where stat = 0
+        if prop_type == "Pitcher Strikeouts":
+            all_game_dates = pd.Series(season_data["game_date"].unique()).sort_values()
+            full_log = season_by_game.reindex(all_game_dates, fill_value=0).reset_index()
+            full_log.columns = ["game_date", stat_name]
+        elif prop_type == "Batter Hits":
+            pa_game_dates = season_data[season_data["events"].notna()]["game_date"].unique()
+            all_game_dates = pd.Series(pa_game_dates).sort_values()
+            full_log = season_by_game.reindex(all_game_dates, fill_value=0).reset_index()
+            full_log.columns = ["game_date", stat_name]
+        else:
+            pa_game_dates = season_data[season_data["events"].notna()]["game_date"].unique()
+            all_game_dates = pd.Series(pa_game_dates).sort_values()
+            full_log = season_by_game.reindex(all_game_dates, fill_value=0).reset_index()
+            full_log.columns = ["game_date", stat_name]
+
+        full_log["game_date"] = full_log["game_date"].astype(str)
+        full_log["vs_line"]   = sportsbook_line
+
+        st.caption(f"Showing all {len(full_log)} games — zeros mean player appeared but recorded 0 {stat_name.lower()}.")
+        st.dataframe(full_log, use_container_width=True)
+        st.bar_chart(full_log.set_index("game_date")[stat_name])
