@@ -33,6 +33,12 @@ import os
 
 cache.enable()
 
+# ---------------------------------------------------------------------------
+# Backtest toggle: set False to disable heat / player-heat / upset adjustments
+# and reproduce the v3 baseline. Used by backtest_compare_heat.py for A/B.
+# ---------------------------------------------------------------------------
+HEAT_FACTORS_ENABLED = True
+
 st.title("MLB Player Prop + Moneyline Predictor")
 
 # ---------------------------------------------------------------------------
@@ -727,9 +733,9 @@ def calculate_team_ops_vs_hand(team_abbrev, pitcher_hand):
     team_abbrev  = team_abbrev.upper()
     pitcher_hand = pitcher_hand.upper()
 
-    data["batting_team"] = data.apply(
-        lambda r: r["away_team"] if r["inning_topbot"] == "Top" else r["home_team"], axis=1
-    )
+    if "batting_team" not in data.columns:
+        is_top = data["inning_topbot"] == "Top"
+        data["batting_team"] = data["away_team"].where(is_top, data["home_team"])
     mask = (
         (data["batting_team"] == team_abbrev)
         & (data["p_throws"] == pitcher_hand)
@@ -763,9 +769,9 @@ def late_inning_runs_allowed(start_date, end_date, selected_team):
     if late.empty:
         return 1.5
 
-    late["fielding_team"] = late.apply(
-        lambda r: r["home_team"] if r["inning_topbot"] == "Top" else r["away_team"], axis=1
-    )
+    if "fielding_team" not in late.columns:
+        is_top = late["inning_topbot"] == "Top"
+        late["fielding_team"] = late["home_team"].where(is_top, late["away_team"])
     tl = late[late["fielding_team"] == selected_team].copy()
     if tl.empty:
         return 1.5
@@ -812,6 +818,200 @@ def team_record_stats(team_abbrev, recent=False):
     }
 
 
+# ---------------------------------------------------------------------------
+# Team / player heat ("fire streak" detection for upset picks)
+# ---------------------------------------------------------------------------
+
+def team_record_last_n(team_abbrev, n=10):
+    """Wins, run-diff, and quality-weighted streak over the last n games."""
+    data = get_team_schedule(today.year, team_abbrev)
+    if data.empty:
+        return {"wins": 0, "games": 0, "win_rate": 0.5, "run_diff": 0.0,
+                "quality_score": 0.0}
+    tail = data.tail(n).copy()
+    games = len(tail)
+    if games == 0:
+        return {"wins": 0, "games": 0, "win_rate": 0.5, "run_diff": 0.0,
+                "quality_score": 0.0}
+    wins = int(tail["win"].sum())
+    run_diff = (tail["R"].mean() - tail["RA"].mean())
+
+    # Quality-weighted score: each game weighted by margin (capped),
+    # so a 10-run blowout matters more than a walk-off squeaker.
+    margins = (tail["R"] - tail["RA"]).clip(lower=-8, upper=8)
+    quality_score = float(margins.mean()) if not margins.empty else 0.0
+
+    return {
+        "wins":          wins,
+        "games":         games,
+        "win_rate":      wins / games,
+        "run_diff":      float(run_diff),
+        "quality_score": quality_score,
+    }
+
+
+@st.cache_data
+def team_offense_heat(team_abbrev):
+    """
+    Recent offense vs season offense (last 30d window already cached).
+    Positive = team is hitting better than its season baseline. Range ~[-1, +1].
+    """
+    try:
+        season = get_statcast_data(season_start, season_end).copy()
+        recent = get_statcast_data(recent_start, recent_end).copy()
+    except Exception:
+        return 0.0
+    team = team_abbrev.upper()
+
+    def woba_for(df):
+        if df.empty:
+            return None
+        df = df.copy()
+        if "batting_team" not in df.columns:
+            is_top = df["inning_topbot"] == "Top"
+            df["batting_team"] = df["away_team"].where(is_top, df["home_team"])
+        tdf = df[(df["batting_team"] == team) & (df["events"].notna())]
+        if tdf.empty:
+            return None
+        # Simple wOBA proxy using event weights
+        weights = {"walk": 0.69, "hit_by_pitch": 0.72, "single": 0.89,
+                   "double": 1.27, "triple": 1.62, "home_run": 2.10}
+        num = sum(weights[k] * (tdf["events"] == k).sum() for k in weights)
+        ab = len(tdf[~tdf["events"].isin(
+            ["walk", "hit_by_pitch", "sac_fly", "sac_bunt", "catcher_interf"]
+        )])
+        bb = (tdf["events"] == "walk").sum()
+        hbp = (tdf["events"] == "hit_by_pitch").sum()
+        sf = (tdf["events"] == "sac_fly").sum()
+        denom = ab + bb + hbp + sf
+        return num / denom if denom > 0 else None
+
+    s_woba = woba_for(season)
+    r_woba = woba_for(recent)
+    if s_woba is None or r_woba is None or s_woba <= 0:
+        return 0.0
+    # Normalize the delta — a 50-point wOBA swing is a big hot streak
+    delta = (r_woba - s_woba) / 0.050
+    return float(max(-1.5, min(1.5, delta)))
+
+
+@st.cache_data
+def team_player_heat(team_abbrev):
+    """
+    Aggregate "player streak" boost for a team. Finds batters who have
+    significantly outperformed their season baseline over the last 30 days,
+    weights them by recent plate appearances (so star regulars matter most).
+    Returns dict with score (~[-1, +1]) and list of top hot/cold names.
+    """
+    try:
+        season = get_statcast_data(season_start, season_end)
+        recent = get_statcast_data(recent_start, recent_end)
+    except Exception:
+        return {"score": 0.0, "hot": [], "cold": []}
+    team = team_abbrev.upper()
+
+    def player_woba_table(df):
+        if df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        if "batting_team" not in df.columns:
+            is_top = df["inning_topbot"] == "Top"
+            df["batting_team"] = df["away_team"].where(is_top, df["home_team"])
+        tdf = df[(df["batting_team"] == team) & (df["events"].notna())].copy()
+        if tdf.empty:
+            return pd.DataFrame()
+        weights = {"walk": 0.69, "hit_by_pitch": 0.72, "single": 0.89,
+                   "double": 1.27, "triple": 1.62, "home_run": 2.10}
+        for k in weights:
+            tdf[k] = (tdf["events"] == k).astype(int)
+        for k in ["sac_fly", "sac_bunt", "catcher_interf"]:
+            tdf[k] = (tdf["events"] == k).astype(int)
+        tdf["pa"] = 1
+        tdf["ab_flag"] = (~tdf["events"].isin(
+            ["walk", "hit_by_pitch", "sac_fly", "sac_bunt", "catcher_interf"]
+        )).astype(int)
+        agg = tdf.groupby("batter").agg(
+            single=("single", "sum"), double=("double", "sum"),
+            triple=("triple", "sum"), hr=("home_run", "sum"),
+            bb=("walk", "sum"), hbp=("hit_by_pitch", "sum"),
+            sf=("sac_fly", "sum"), pa=("pa", "sum"), ab=("ab_flag", "sum"),
+            name=("player_name", "first") if "player_name" in tdf.columns else ("batter", "first"),
+        )
+        num = (weights["walk"]*agg["bb"] + weights["hit_by_pitch"]*agg["hbp"]
+               + weights["single"]*agg["single"] + weights["double"]*agg["double"]
+               + weights["triple"]*agg["triple"] + weights["home_run"]*agg["hr"])
+        denom = (agg["ab"] + agg["bb"] + agg["hbp"] + agg["sf"]).replace(0, 1)
+        agg["woba"] = num / denom
+        return agg
+
+    season_t = player_woba_table(season)
+    recent_t = player_woba_table(recent)
+    if season_t.empty or recent_t.empty:
+        return {"score": 0.0, "hot": [], "cold": []}
+
+    # Keep batters with at least 30 season PA (regulars) and 15 recent PA
+    season_t = season_t[season_t["pa"] >= 30]
+    recent_t = recent_t[recent_t["pa"] >= 15]
+    joined = recent_t.join(season_t, lsuffix="_r", rsuffix="_s", how="inner")
+    if joined.empty:
+        return {"score": 0.0, "hot": [], "cold": []}
+
+    joined["delta"] = joined["woba_r"] - joined["woba_s"]
+    # PA-weighted average delta, normalized so 0.050 wOBA = +1
+    total_pa = joined["pa_r"].sum()
+    if total_pa <= 0:
+        return {"score": 0.0, "hot": [], "cold": []}
+    weighted_delta = (joined["delta"] * joined["pa_r"]).sum() / total_pa
+    score = float(max(-1.5, min(1.5, weighted_delta / 0.050)))
+
+    name_col = "name_r" if "name_r" in joined.columns else None
+    hot = []
+    cold = []
+    top = joined.sort_values("delta", ascending=False)
+    bot = joined.sort_values("delta", ascending=True)
+    for _, row in top.head(3).iterrows():
+        if row["delta"] <= 0:
+            break
+        nm = row[name_col] if name_col else str(row.name)
+        hot.append((nm, float(row["delta"])))
+    for _, row in bot.head(2).iterrows():
+        if row["delta"] >= 0:
+            break
+        nm = row[name_col] if name_col else str(row.name)
+        cold.append((nm, float(row["delta"])))
+
+    return {"score": score, "hot": hot, "cold": cold}
+
+
+def compute_team_heat(team_abbrev):
+    """
+    Composite team "fire streak" score, normalized to roughly [-1.5, +1.5].
+    Combines: last-10 win rate vs .500, recent run-diff momentum,
+    quality-weighted streak, and team offense heat. NOT player heat —
+    that is added separately so we can surface it in the UI.
+    """
+    season = team_record_stats(team_abbrev, recent=False)
+    last10 = team_record_last_n(team_abbrev, n=10)
+    streak = get_streak(team_abbrev)
+
+    wr_div = (last10["win_rate"] - season["win_rate"]) * 2.0     # ~[-0.5, +0.5]
+    streak_norm = (float(streak) * 0.5 + last10["quality_score"] * 0.5) / 5.0
+    rd_div = (last10["run_diff"] - season["run_diff"]) / 2.0     # ~[-1, +1]
+    off_heat = team_offense_heat(team_abbrev)                    # ~[-1.5, +1.5]
+
+    raw = wr_div + streak_norm * 0.6 + rd_div * 0.7 + off_heat * 0.6
+    score = float(max(-1.5, min(1.5, raw)))
+
+    return {
+        "score":           score,
+        "last10_record":   f"{last10['wins']}-{last10['games'] - last10['wins']}",
+        "last10_run_diff": last10["run_diff"],
+        "quality_streak":  streak_norm,
+        "offense_heat":    off_heat,
+        "current_streak":  streak,
+    }
+
+
 @st.cache_data
 def get_season_k_rate(opponent_team):
     """
@@ -820,9 +1020,11 @@ def get_season_k_rate(opponent_team):
     """
     try:
         data = get_statcast_data(season_start, season_end)
-        data["batting_team"] = data.apply(
-            lambda r: r["away_team"] if r["inning_topbot"] == "Top" else r["home_team"], axis=1
-        )
+        if "batting_team" not in data.columns:
+            is_top = data["inning_topbot"] == "Top"
+            data = data.assign(
+                batting_team=data["away_team"].where(is_top, data["home_team"])
+            )
         opp    = data[data["batting_team"] == opponent_team.upper()]
         tot_pa = opp[opp["events"].notna()]
         opp_ks = opp[opp["events"] == "strikeout"]
@@ -839,9 +1041,9 @@ def get_season_k_rate(opponent_team):
 def opponent_k_adjustment_recent(opponent_team):
     """Recent (30-day) K rate relative to league average."""
     data = get_statcast_data(recent_start, recent_end)
-    data["batting_team"] = data.apply(
-        lambda r: r["away_team"] if r["inning_topbot"] == "Top" else r["home_team"], axis=1
-    )
+    if "batting_team" not in data.columns:
+        is_top = data["inning_topbot"] == "Top"
+        data["batting_team"] = data["away_team"].where(is_top, data["home_team"])
     opp    = data[data["batting_team"] == opponent_team.upper()]
     tot_pa = opp[opp["events"].notna()]
     opp_ks = opp[opp["events"] == "strikeout"]
@@ -1362,6 +1564,37 @@ def team_moneyline_probability(
     form_adj = clamp(form_adj, -0.06, 0.06)
     adjustments["recent_run_diff_divergence"] = round(form_adj, 4)
 
+    # 5b/5c. Heat factors (gated by HEAT_FACTORS_ENABLED for A/B backtesting).
+    if HEAT_FACTORS_ENABLED:
+        # Team "fire streak" composite — last-10 vs season + quality streak +
+        # offense heat (wOBA-based). Lets the model see hot underdogs.
+        team_heat_data = compute_team_heat(team)
+        opp_heat_data  = compute_team_heat(opponent_team)
+        heat_diff      = team_heat_data["score"] - opp_heat_data["score"]
+        heat_adj       = heat_diff * 0.060
+        heat_adj       = clamp(heat_adj, -0.12, 0.12)
+        adjustments["team_heat"] = round(heat_adj, 4)
+
+        # Player heat — top hitters who have been on a tear (e.g. PCA for CHC).
+        team_player_data = team_player_heat(team)
+        opp_player_data  = team_player_heat(opponent_team)
+        player_diff      = team_player_data["score"] - opp_player_data["score"]
+        player_adj       = player_diff * 0.045
+        player_adj       = clamp(player_adj, -0.08, 0.08)
+        adjustments["player_heat"] = round(player_adj, 4)
+    else:
+        # v3 baseline: no heat signals.
+        team_heat_data = {"score": 0.0, "last10_record": "—",
+                          "last10_run_diff": 0.0, "quality_streak": 0.0,
+                          "offense_heat": 0.0, "current_streak": 0}
+        opp_heat_data  = dict(team_heat_data)
+        team_player_data = {"score": 0.0, "hot": [], "cold": []}
+        opp_player_data  = {"score": 0.0, "hot": [], "cold": []}
+        heat_diff = 0.0
+        player_diff = 0.0
+        heat_adj = 0.0
+        player_adj = 0.0
+
     # 6. wRC+ offense edge, smaller than v2
     wrc_diff = team_wrc - opp_wrc
     wrc_adj  = wrc_diff * 0.0020
@@ -1385,10 +1618,35 @@ def team_moneyline_probability(
 
     # ---- Final probability ----
     total_logit_adjustment = sum(adjustments.values())
+
+    # Upset boost: when this team is the dog AND has confluent heat signals
+    # (positive team_heat + positive player_heat + positive form), give an
+    # extra nudge. This is what actually lets the model pick a live dog over
+    # the book favorite instead of just rubber-stamping Vegas.
+    is_dog = book_implied < 0.50
+    upset_score = 0.0
+    if HEAT_FACTORS_ENABLED:
+        positive_signals = sum(1 for v in [heat_adj, player_adj, form_adj] if v > 0.01)
+        if is_dog and positive_signals >= 2:
+            upset_raw = (
+                heat_diff * 0.4
+                + player_diff * 0.3
+                + (team_rd_delta - opp_rd_delta) * 0.15
+                + (1 if sel_quality < opp_quality else 0) * 0.2  # dog has SP edge
+            )
+            upset_score = float(max(0.0, min(1.5, upset_raw)))
+            upset_boost = upset_score * 0.10
+            adjustments["upset_boost"] = round(upset_boost, 4)
+            total_logit_adjustment += upset_boost
+
     model_logit = logit(book_implied) + total_logit_adjustment
     model_prob = inverse_logit(model_logit)
-    # Hard cap: realistic MLB win-prob range
-    model_prob = round(clamp(model_prob, 0.38, 0.68), 6)
+    # v3 clamp when heat is off, wider clamp when heat is on (so genuine upsets
+    # aren't capped). Keeps the A/B comparison apples-to-apples for v3.
+    if HEAT_FACTORS_ENABLED:
+        model_prob = round(clamp(model_prob, 0.30, 0.75), 6)
+    else:
+        model_prob = round(clamp(model_prob, 0.38, 0.68), 6)
     probability_adjustment = model_prob - book_implied
 
     return {
@@ -1440,6 +1698,12 @@ def team_moneyline_probability(
         "umpire_name":        umpire_name,
         "sel_fip_era_gap":    sel_fip_era_gap,
         "opp_fip_era_gap":    opp_fip_era_gap,
+        "team_heat":          team_heat_data,
+        "opp_heat":           opp_heat_data,
+        "team_player_heat":   team_player_data,
+        "opp_player_heat":    opp_player_data,
+        "upset_score":        round(upset_score, 3),
+        "is_dog":             is_dog,
     }
 
 
@@ -1773,6 +2037,42 @@ if st.button("Predict"):
                     arrow = "▲" if val > 0 else ("▼" if val < 0 else "—")
                     st.text(f"  {arrow} {factor:<30} logit {val:+.4f}")
 
+                # ---- Upset Watch ----
+                dog_pred = d["home_pred"] if d["home_implied"] < d["away_implied"] else d["away_pred"]
+                dog_side = d["home_abbrev"] if d["home_implied"] < d["away_implied"] else d["away_abbrev"]
+                if dog_pred.get("upset_score", 0) >= 0.30:
+                    th = dog_pred.get("team_heat", {})
+                    ph = dog_pred.get("team_player_heat", {})
+                    st.warning(
+                        f"🔥 **Upset Watch — {dog_side}** "
+                        f"(upset score {dog_pred['upset_score']:.2f})"
+                    )
+                    bullets = []
+                    if th:
+                        bullets.append(
+                            f"Last 10: {th.get('last10_record', '?')} · "
+                            f"run diff {th.get('last10_run_diff', 0):+.2f} · "
+                            f"streak {int(th.get('current_streak', 0)):+d}"
+                        )
+                    if ph and ph.get("hot"):
+                        names = ", ".join(
+                            f"{n.split(',')[0].strip() if ',' in n else n} (+{dlt:.3f} wOBA)"
+                            for n, dlt in ph["hot"][:3]
+                        )
+                        bullets.append(f"Hot bats: {names}")
+                    # Also flag if the favorite's roster has cold bats
+                    fav_pred = d["home_pred"] if d["home_implied"] >= d["away_implied"] else d["away_pred"]
+                    fav_side = d["home_abbrev"] if d["home_implied"] >= d["away_implied"] else d["away_abbrev"]
+                    fav_ph = fav_pred.get("team_player_heat", {})
+                    if fav_ph and fav_ph.get("cold"):
+                        cold_names = ", ".join(
+                            f"{n.split(',')[0].strip() if ',' in n else n} ({dlt:+.3f} wOBA)"
+                            for n, dlt in fav_ph["cold"][:2]
+                        )
+                        bullets.append(f"{fav_side} cold bats: {cold_names}")
+                    for b in bullets:
+                        st.caption(f"  • {b}")
+
                 # Pitcher K detail
                 st.markdown("**Pitcher Strikeouts**")
                 k_cols = st.columns(2)
@@ -1924,6 +2224,9 @@ if st.button("Predict"):
                 "late_inning_bullpen_regressed": "Late-inning bullpen",
                 "injury_differential":    "IL injury differential",
                 "home_field":             "Home field",
+                "team_heat":              "Team fire streak (last-10 + run-diff)",
+                "player_heat":            "Player hot bats vs opponent",
+                "upset_boost":            "Live underdog convergence boost",
             }
             display_name = label_map.get(factor, factor)
             st.text(f"  {direction} {display_name:<35} {pct_str}  {bar}")
@@ -1935,6 +2238,59 @@ if st.button("Predict"):
             f"{opponent_team.upper()} starter: ERA {result['opp_p_info']['era']:.2f} / "
             f"FIP {result['opp_p_info']['fip']:.2f} (gap: {result['opp_fip_era_gap']:+.2f})"
         )
+
+        # ---- Upset Watch / Fire Streak panel ----
+        st.subheader("🔥 Fire Streak / Upset Watch")
+        th = result.get("team_heat", {})
+        oh = result.get("opp_heat", {})
+        ph = result.get("team_player_heat", {})
+        oph = result.get("opp_player_heat", {})
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            st.markdown(f"**{team.upper()}**")
+            st.write(f"Last 10: {th.get('last10_record', '?')}")
+            st.write(f"Recent run diff: {th.get('last10_run_diff', 0):+.2f}")
+            st.write(f"Current streak: {int(th.get('current_streak', 0)):+d}")
+            st.write(f"Heat score: **{th.get('score', 0):+.2f}**")
+            if ph.get("hot"):
+                st.caption("Hot bats:")
+                for n, dlt in ph["hot"][:3]:
+                    short = n.split(",")[0].strip() if "," in n else n
+                    st.text(f"  🔥 {short}: {dlt:+.3f} wOBA vs season")
+            if ph.get("cold"):
+                st.caption("Cold bats:")
+                for n, dlt in ph["cold"][:2]:
+                    short = n.split(",")[0].strip() if "," in n else n
+                    st.text(f"  🧊 {short}: {dlt:+.3f} wOBA vs season")
+        with hc2:
+            st.markdown(f"**{opponent_team.upper()}**")
+            st.write(f"Last 10: {oh.get('last10_record', '?')}")
+            st.write(f"Recent run diff: {oh.get('last10_run_diff', 0):+.2f}")
+            st.write(f"Current streak: {int(oh.get('current_streak', 0)):+d}")
+            st.write(f"Heat score: **{oh.get('score', 0):+.2f}**")
+            if oph.get("hot"):
+                st.caption("Hot bats:")
+                for n, dlt in oph["hot"][:3]:
+                    short = n.split(",")[0].strip() if "," in n else n
+                    st.text(f"  🔥 {short}: {dlt:+.3f} wOBA vs season")
+            if oph.get("cold"):
+                st.caption("Cold bats:")
+                for n, dlt in oph["cold"][:2]:
+                    short = n.split(",")[0].strip() if "," in n else n
+                    st.text(f"  🧊 {short}: {dlt:+.3f} wOBA vs season")
+
+        upset_score = result.get("upset_score", 0)
+        if result.get("is_dog") and upset_score >= 0.30:
+            st.warning(
+                f"🚨 **Live Underdog signal — {team.upper()}** "
+                f"(upset score {upset_score:.2f}). "
+                f"Multiple heat factors agree against a Vegas favorite."
+            )
+        elif result.get("is_dog"):
+            st.caption(
+                f"No upset signal: dog needs ≥2 positive heat factors. "
+                f"Current upset score {upset_score:.2f}."
+            )
 
         # ---- Starting Pitchers ----
         st.subheader("⚾ Starting Pitchers")
