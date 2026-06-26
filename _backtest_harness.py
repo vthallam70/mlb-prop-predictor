@@ -507,34 +507,86 @@ def _patch_heat_functions():
 _patch_heat_functions()
 
 
+_STATCAST_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".mlb_backtest_cache")
+
+
+def _find_cached_statcast(year: int, end_date: str) -> str | None:
+    """
+    Find a cached statcast parquet for this year. Prefers exact end_date match,
+    falls back to any cached file with a LATER end_date (we can slice from it).
+    Returns the path or None.
+    """
+    if not os.path.isdir(_STATCAST_CACHE_DIR):
+        return None
+    exact = os.path.join(_STATCAST_CACHE_DIR, f"statcast_{year}_through_{end_date}.parquet")
+    if os.path.exists(exact):
+        return exact
+    # Look for any later cached version we can slice from.
+    prefix = f"statcast_{year}_through_"
+    candidates = []
+    for fn in os.listdir(_STATCAST_CACHE_DIR):
+        if fn.startswith(prefix) and fn.endswith(".parquet"):
+            ed = fn[len(prefix):-len(".parquet")]
+            if ed >= end_date:
+                candidates.append((ed, os.path.join(_STATCAST_CACHE_DIR, fn)))
+    if candidates:
+        # Pick the SMALLEST later one (less data to slice / load)
+        candidates.sort()
+        return candidates[0][1]
+    return None
+
+
 def preload_statcast(year: int, end_date: str | None = None) -> None:
     """
     Pull every statcast pitch for `year` (from 03-27 to end_date or 11-01)
     once and stash it. Subsequent `app.get_statcast_data(start, end)` calls
     return a slice from the stash instead of hitting pybaseball.
+
+    Caches the post-processed DataFrame to ~/.mlb_backtest_cache/ as parquet.
+    Subsequent runs (this process or a fresh one) load from parquet in ~1s
+    instead of paying the 3-5 min pybaseball download.
     """
     import pandas as pd
-    from pybaseball import statcast
 
     if year in _PRELOADED_STATCAST:
         return
 
     start = f"{year}-03-27"
     end = end_date or f"{year}-11-01"
-    print(f"  [harness] Preloading statcast {start} → {end} (one-time pull)…")
-    df = statcast(start, end)
-    df = df.copy()
-    # Normalize game_date to string for cheap comparison against the YYYY-MM-DD
-    # strings that app.py passes around.
-    df["game_date"] = pd.to_datetime(df["game_date"]).dt.strftime("%Y-%m-%d")
-    # Precompute batting_team / fielding_team using vectorized ops — app.py
-    # functions otherwise do a per-row .apply() on 218k rows each call, which
-    # was the dominant CPU cost.
-    is_top = df["inning_topbot"] == "Top"
-    df["batting_team"] = df["away_team"].where(is_top, df["home_team"])
-    df["fielding_team"] = df["home_team"].where(is_top, df["away_team"])
+
+    os.makedirs(_STATCAST_CACHE_DIR, exist_ok=True)
+    cache_hit = _find_cached_statcast(year, end)
+
+    if cache_hit:
+        print(f"  [harness] Loading statcast from disk cache: {cache_hit}")
+        df = pd.read_parquet(cache_hit)
+        # If we loaded a larger window, slice it to what was requested.
+        df = df[(df["game_date"] >= start) & (df["game_date"] <= end)]
+    else:
+        from pybaseball import statcast
+        print(f"  [harness] Preloading statcast {start} → {end} (one-time pull)…")
+        df = statcast(start, end)
+        df = df.copy()
+        # Normalize game_date to string for cheap comparison against the YYYY-MM-DD
+        # strings that app.py passes around.
+        df["game_date"] = pd.to_datetime(df["game_date"]).dt.strftime("%Y-%m-%d")
+        # Precompute batting_team / fielding_team using vectorized ops — app.py
+        # functions otherwise do a per-row .apply() on 218k rows each call.
+        is_top = df["inning_topbot"] == "Top"
+        df["batting_team"] = df["away_team"].where(is_top, df["home_team"])
+        df["fielding_team"] = df["home_team"].where(is_top, df["away_team"])
+        # Cache to parquet for next time
+        cache_path = os.path.join(
+            _STATCAST_CACHE_DIR, f"statcast_{year}_through_{end}.parquet"
+        )
+        try:
+            df.to_parquet(cache_path, compression="snappy", index=False)
+            print(f"  [harness] Cached to {cache_path}")
+        except Exception as e:
+            print(f"  [harness] Warning: could not cache to parquet: {e}")
+
     _PRELOADED_STATCAST[year] = df
-    print(f"  [harness] Statcast preload done: {len(df):,} pitches cached")
+    print(f"  [harness] Statcast ready: {len(df):,} pitches in memory")
 
     # Install the in-memory slicer in place of app.get_statcast_data.
     def sliced(start_date: str, end_date: str):

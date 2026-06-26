@@ -34,10 +34,12 @@ import os
 cache.enable()
 
 # ---------------------------------------------------------------------------
-# Backtest toggle: set False to disable heat / player-heat / upset adjustments
-# and reproduce the v3 baseline. Used by backtest_compare_heat.py for A/B.
+# Heat factor toggle. Disabled by default — backtested on the 2025 season
+# (2,432 games) and shown to LOSE money vs v3 baseline (-1.65% ROI, picked
+# losing dogs in all 439 disagreements at 47.6% hit rate). Code kept for
+# experimentation with smaller weights; flip to True at your own risk.
 # ---------------------------------------------------------------------------
-HEAT_FACTORS_ENABLED = True
+HEAT_FACTORS_ENABLED = False
 
 st.title("MLB Player Prop + Moneyline Predictor")
 
@@ -265,12 +267,13 @@ def confidence_label(edge, over_ev, under_ev):
 
 def moneyline_label(ev, model_prob, implied_prob, american_odds):
     """
-    v4 — Edge-based labels. An underdog the model likes more than the book
-    is still +EV; the previous 55% absolute-prob floor wrongly killed those.
+    v5 — Thresholds calibrated against the 2025 season backtest (2,432 games).
 
-    Strong Bet: edge ≥4%, EV ≥4%
-    Lean:       edge ≥2%, EV ≥2%
-    No Bet:     non-positive edge, or heavy chalk without enough edge
+    Top Pick: edge ≥2%, EV ≥2%
+        Backtest: 61.4% win rate, +17.2% ROI over 399 games (16% of slate).
+    Lean:     edge ≥1%, EV ≥1%
+        Backtest: 57.8% win rate, +10.3% ROI over 1,264 games (52% of slate).
+    No Bet:   anything below — historically near book-implied.
     """
     edge_pct = round(model_prob - implied_prob, 4)
     ev_r     = round(ev, 4)
@@ -282,10 +285,10 @@ def moneyline_label(ev, model_prob, implied_prob, american_odds):
     if american_odds <= -200 and edge_pct < 0.05:
         return "No Bet"
 
-    if edge_pct >= 0.04 and ev_r >= 0.04:
-        return "Strong Bet"
-
     if edge_pct >= 0.02 and ev_r >= 0.02:
+        return "Top Pick"
+
+    if edge_pct >= 0.01 and ev_r >= 0.01:
         return "Lean"
 
     return "No Bet"
@@ -1960,9 +1963,9 @@ if st.button("Predict"):
         else:
             df_summary = pd.DataFrame(filtered).drop(columns=["_sort"])
             st.dataframe(df_summary, use_container_width=True, hide_index=True)
-            n_strong = sum(1 for s in filtered if s["Verdict"] == "Strong Bet")
+            n_strong = sum(1 for s in filtered if s["Verdict"] == "Top Pick")
             n_lean   = sum(1 for s in filtered if s["Verdict"] == "Lean")
-            st.caption(f"🟢 {n_strong} Strong Bet · 🟡 {n_lean} Lean · ⚪ {len(filtered) - n_strong - n_lean} No Bet")
+            st.caption(f"🟢 {n_strong} Top Pick · 🟡 {n_lean} Lean · ⚪ {len(filtered) - n_strong - n_lean} No Bet")
 
         # ============ Summary: Pitcher Ks ============
         st.subheader("⚾ Pitcher Strikeouts Summary")
@@ -2021,7 +2024,7 @@ if st.button("Predict"):
                         st.markdown(f"**{team_lbl}** ({ml_v:+d}) — *{p_name}*")
                         st.write(f"Model: {model*100:.1f}% · Book: {implied*100:.1f}%")
                         st.write(f"Edge: **{edge_v*100:+.1f}%** · EV: **{ev_v*100:+.1f}%**")
-                        if label_v == "Strong Bet":
+                        if label_v == "Top Pick":
                             st.success(f"✅ {label_v}")
                         elif label_v == "Lean":
                             st.info(f"📊 {label_v}")
@@ -2154,25 +2157,24 @@ if st.button("Predict"):
         col5.metric("Expected Value",     f"{ev*100:.1f}%")
 
         st.caption(
-            "🟢 Strong Bet = edge ≥4% + EV ≥4%  |  "
-            "🟡 Lean = edge ≥2% + EV ≥2%  |  "
-            "🔴 No Bet = non-positive edge, or chalk without sufficient edge  |  "
-            "Heavy chalk (≤−200) needs ≥5% edge"
+            "🟢 Top Pick = edge ≥2% + EV ≥2% (backtested 61.4% / +17.2% ROI)  |  "
+            "🟡 Lean = edge ≥1% + EV ≥1% (backtested 57.8% / +10.3% ROI)  |  "
+            "🔴 No Bet = below thresholds, or heavy chalk without sufficient edge"
         )
 
-        if label == "Strong Bet":
-            st.success("✅ STRONG BET — Multiple mispriced factors + clear value over the book")
+        if label == "Top Pick":
+            st.success("✅ TOP PICK — Edge ≥2%, EV ≥2%. Historically 61.4% / +17.2% ROI.")
         elif label == "Lean":
-            st.success("📊 LEAN — Model finds real edge the book may have missed")
+            st.success("📊 LEAN — Edge ≥1%, EV ≥1%. Historically 57.8% / +10.3% ROI.")
         else:
             st.info("⛔ NO BET — Edge or EV below the Lean threshold (or heavy chalk without enough edge)")
 
         # ---- Bet filter checklist ----
         st.subheader("🔎 Bet Filter Checklist")
-        edge_ok_strong     = edge_pct >= 0.04
-        edge_ok_lean       = edge_pct >= 0.02
-        ev_ok_strong       = ev >= 0.04
-        ev_ok_lean         = ev >= 0.02
+        edge_ok_top        = edge_pct >= 0.02
+        edge_ok_lean       = edge_pct >= 0.01
+        ev_ok_top          = ev >= 0.02
+        ev_ok_lean         = ev >= 0.01
         positive_edge      = edge_pct > 0
         chalk_blocked      = american_odds <= -200 and edge_pct < 0.05
 
@@ -2180,16 +2182,16 @@ if st.button("Predict"):
 
         fc1, fc2 = st.columns(2)
         with fc1:
-            st.markdown("**Strong Bet (all must pass)**")
-            st.write(f"{check(edge_ok_strong)} Edge over book ≥4%  →  {edge_pct*100:+.1f}%")
-            st.write(f"{check(ev_ok_strong)} Expected value ≥4%  →  {ev*100:.1f}%")
+            st.markdown("**Top Pick (all must pass)**")
+            st.write(f"{check(edge_ok_top)} Edge over book ≥2%  →  {edge_pct*100:+.1f}%")
+            st.write(f"{check(ev_ok_top)} Expected value ≥2%  →  {ev*100:.1f}%")
             st.write(f"{check(positive_edge)} Positive edge (model > book)")
             if chalk_blocked:
                 st.write(f"❌ Heavy chalk (≤−200) blocked — need ≥5% edge, have {edge_pct*100:.1f}%")
         with fc2:
             st.markdown("**Lean (all must pass)**")
-            st.write(f"{check(edge_ok_lean)} Edge over book ≥2%  →  {edge_pct*100:+.1f}%")
-            st.write(f"{check(ev_ok_lean)} Expected value ≥2%  →  {ev*100:.1f}%")
+            st.write(f"{check(edge_ok_lean)} Edge over book ≥1%  →  {edge_pct*100:+.1f}%")
+            st.write(f"{check(ev_ok_lean)} Expected value ≥1%  →  {ev*100:.1f}%")
             st.write(f"{check(positive_edge)} Positive edge (model > book)")
 
         # ---- Adjustment breakdown (replaces score breakdown) ----

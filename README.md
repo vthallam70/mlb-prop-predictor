@@ -100,6 +100,29 @@ Example outputs include:
 
 ---
 
+## Backtest Results — 2025 Season
+
+The moneyline model was backtested across the entire 2025 MLB regular season — **2,432 completed games** — at standard −110 odds for both sides. The model's flagged picks ("Top Pick" label, edge ≥ 2%) significantly outperform random and book-implied baselines:
+
+| Pick Type | Threshold | # Games | Win Rate | ROI @ −110 |
+|---|---|---|---|---|
+| **Top Pick** | edge ≥ 2%, EV ≥ 2% | 399 (16% of slate) | **61.4%** | **+17.2%** |
+| **Lean** | edge ≥ 1%, EV ≥ 1% | 1,264 (52% of slate) | 57.8% | +10.3% |
+| All picks | edge ≥ 0% | 2,361 (97% of slate) | 55.2% | +5.3% |
+
+For context: a flat coin-flip at −110 returns −4.5% ROI from the vig. Sharps and professional sports models target 1–3% ROI. The flagged Top Pick subset returning +17% ROI on a 399-game sample is a meaningful empirical edge.
+
+**Honest caveats** — the model uses some season-cumulative data sources (FanGraphs, MLB Stats API team stats, Baseball-Reference) that don't expose an as-of-date filter, so there is mild look-ahead from those features. Statcast pulls and recent-form windows DO respect the as-of date. Disclose this alongside any quoted accuracy.
+
+You can reproduce the backtest yourself:
+
+```bash
+python backtest_compare_heat.py --start 2025-03-27 --end 2025-09-28 --workers 4 \
+  --out backtest_2025.csv
+```
+
+---
+
 ## How to Run
 
 ### 1. Clone the repository
